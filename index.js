@@ -4,8 +4,15 @@ const { OAuth2Client } = require('google-auth-library')
 const createError = require('http-errors')
 const CryptoJS = require('crypto-js')
 const express = require('express')
+const moment = require('moment')
 
 const SPREADSHEET_ID = '1dJhB5_auh5Fzqy7VfUnmFPpiT7OYF5BvpZ6nmrV9RJo'
+
+const log = (...args) => {
+  _.each(args, (arg, i) => {
+    console.log(i, _.truncate(JSON.stringify(arg), { length: 1000 }))
+  })
+}
 
 /**
  * 取得 process.env.[key] 的輔助函式，且可以有預設值
@@ -13,6 +20,8 @@ const SPREADSHEET_ID = '1dJhB5_auh5Fzqy7VfUnmFPpiT7OYF5BvpZ6nmrV9RJo'
 exports.getenv = (key, defaultval) => {
   return _.get(process, ['env', key], defaultval)
 }
+
+exports.getNow = () => moment().utcOffset(8)
 
 exports.parseCourse = async jwt => {
   if (!jwt || !_.isString(jwt)) throw createError(400, 'course 必填')
@@ -34,8 +43,10 @@ exports.jwtSecret = (() => {
       const res = await sheetsAPI.developerMetadata.get({
         spreadsheetId: SPREADSHEET_ID,
         metadataId: 1,
+        // https://developers.google.com/sheets/api/guides/concepts#partial_responses
+        fields: 'metadataKey,metadataValue',
       })
-      // console.log(res)
+      // log(JSON.stringify(res.data))
       const { metadataKey: key, metadataValue: value } = _.get(res, 'data')
       secret = key === 'jwt-secret' ? value : null
     }
@@ -93,15 +104,142 @@ exports.parseIdToken = (() => {
   }
 })()
 
+exports.sheetAppend = async (range, row) => {
+  const sheetsAPI = await exports.sheetsAPI()
+  const res = await sheetsAPI.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+    valueInputOption: 'RAW',
+    insertDataOption: 'INSERT_ROWS',
+    responseValueRenderOption: 'FORMATTED_VALUE',
+    responseDateTimeRenderOption: 'FORMATTED_STRING',
+    // https://developers.google.com/sheets/api/guides/concepts#partial_responses
+    fields: 'updates',
+    resource: {
+      range,
+      majorDimension: 'ROWS',
+      values: [row],
+    }
+  })
+  log('sheetAppend', res.data)
+  return res.data
+}
+
+exports.sheetSetRowMetadata = async (range, key, value) => {
+  const sheetsAPI = await exports.sheetsAPI()
+  const res = await sheetsAPI.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    // https://developers.google.com/sheets/api/guides/concepts#partial_responses
+    fields: 'replies',
+    resource: _.set({}, 'requests.0.createDeveloperMetadata.developerMetadata', {
+      metadataKey: key,
+      metadataValue: value,
+      visibility: 'DOCUMENT',
+      location: await exports.sheetRowToLocation(range),
+    })
+  })
+  log('sheetSetRowMetadata', res.data)
+  return res.data
+}
+
+exports.sheetDelMetadata = async metadata => {
+  const sheetsAPI = await exports.sheetsAPI()
+  const res = await sheetsAPI.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    // https://developers.google.com/sheets/api/guides/concepts#partial_responses
+    fields: 'replies',
+    resource: _.set({}, 'requests.0.deleteDeveloperMetadata.dataFilter.developerMetadataLookup', {
+      metadataKey: metadata.key,
+      metadataValue: metadata.value,
+    })
+  })
+  log('sheetSetRowMetadata', res.data)
+  return _.get(res, 'data.replies.0.deleteDeveloperMetadata.deletedDeveloperMetadata.length', 0)
+}
+
+exports.sheetRowToLocation = async range => {
+  const sheetsAPI = await exports.sheetsAPI()
+  const res = await sheetsAPI.get({
+    spreadsheetId: SPREADSHEET_ID,
+    includeGridData: false,
+    ranges: [range],
+    // https://developers.google.com/sheets/api/guides/concepts#partial_responses
+    fields: 'sheets(data.startRow,properties.sheetId)',
+  })
+  log('sheetRowToLocation', res.data)
+  const startIndex = _.get(res, 'data.sheets.0.data.0.startRow')
+  return {
+    dimensionRange: {
+      sheetId: _.get(res, 'data.sheets.0.properties.sheetId'),
+      dimension: 'ROWS',
+      startIndex: startIndex,
+      endIndex: startIndex + 1,
+    }
+  }
+}
+
+exports.sheetUpdateByMetadata = async ({ row, metadata }) => {
+  const sheetsAPI = await exports.sheetsAPI()
+  const res = await sheetsAPI.values.batchUpdateByDataFilter({
+    spreadsheetId: SPREADSHEET_ID,
+    fields: 'totalUpdatedCells',
+    resource: {
+      valueInputOption: 'RAW',
+      data: [{
+        majorDimension: 'ROWS',
+        values: [row],
+        dataFilter: {
+          developerMetadataLookup: {
+            metadataKey: metadata.key,
+            metadataValue: metadata.value,
+          }
+        },
+      }]
+    }
+  })
+  log('sheetUpdateByMetadata', res.data)
+  return _.get(res, 'data.totalUpdatedCells', 0)
+}
+
+exports.upsertUser = async (user, nowStr) => {
+  // 先嘗試使用更新
+  const updated = await exports.sheetUpdateByMetadata({
+    row: [user.id, user.name, user.email, user.imageUrl, null, nowStr],
+    metadata: { key: 'gid', value: user.id }
+  })
+  if (updated) return
+
+  // 沒有更新成功，改用新增的
+  const userRow = [user.id, user.name, user.email, user.imageUrl, nowStr, nowStr]
+  const range = _.get(await exports.sheetAppend('users!A:F', userRow), 'updates.updatedRange')
+  await exports.sheetSetRowMetadata(range, 'gid', user.id)
+}
+
+exports.checkInCourse = async (user, course, nowStr) => {
+  // 先嘗試找到課程並把使用者紀錄上去
+  const metadata = { key: 'nonce', value: course.nonce }
+  const updated = await exports.sheetUpdateByMetadata({
+    row: [user.id, null, null, null, nowStr],
+    metadata,
+  })
+  if (!updated) throw createError(404, '這個課程網址已失效，請重新取得')
+
+  const deleted = await exports.sheetDelMetadata(metadata)
+  if (!deleted) throw createError(500, '課程 metadata 刪除失敗')
+}
+
 exports.handler = async (req, res) => {
   try {
     const [course, user] = await Promise.all([
       exports.parseCourse(req.body.c || req.query.c),
       exports.parseIdToken(req.body.g || req.query.g),
     ])
+    const nowStr = exports.getNow().format('YYYY-MM-DD HH:mm:ss')
+    await exports.checkInCourse(user, course, nowStr)
+    await exports.upsertUser(user, nowStr)
     res.status(200).json({ course, user })
   } catch (err) {
-    console.log(err)
+    log('handler', err)
     const status = err.status || 500
     res.status(status).json({
       message: err.message,

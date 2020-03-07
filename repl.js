@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+require('dotenv').config() // init dotenv
+
 const _ = require('lodash')
 const Repl = require('repl')
 
