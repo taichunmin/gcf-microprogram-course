@@ -71,19 +71,24 @@ exports.parseIdToken = (() => {
   const CLIENT_ID = '417954202747-62a0pn2ankrsco790jr1h29n9vnf92lm.apps.googleusercontent.com'
   const client = new OAuth2Client(CLIENT_ID)
   return async idToken => {
-    if (!idToken || !_.isString(idToken)) throw createError(400, 'idToken 必填')
-    const ticket = await client.verifyIdToken({
-      idToken,
-      audience: CLIENT_ID,
-    })
-    const payload = ticket.getPayload()
-    return {
-      id: payload.sub,
-      email: payload.email,
-      domain: payload.hd,
-      name: payload.name,
-      imageUrl: payload.picture,
-      locale: payload.locale,
+    try {
+      if (!idToken || !_.isString(idToken)) throw createError(400, 'idToken 必填')
+      const ticket = await client.verifyIdToken({
+        idToken,
+        audience: CLIENT_ID,
+      })
+      const payload = ticket.getPayload()
+      return {
+        id: payload.sub,
+        email: payload.email,
+        domain: payload.hd,
+        name: payload.name,
+        imageUrl: payload.picture,
+        locale: payload.locale,
+      }
+    } catch (err) {
+      err.status = err.status || 401
+      throw err
     }
   }
 })()
@@ -97,7 +102,11 @@ exports.handler = async (req, res) => {
     res.status(200).json({ course, user })
   } catch (err) {
     console.log(err)
-    throw new err
+    const status = err.status || 500
+    res.status(status).json({
+      message: err.message,
+      status,
+    })
   }
 }
 
@@ -107,13 +116,5 @@ router.use(require('cors')()) // cors
 
 router.get('/', exports.handler)
 router.post('/', exports.handler)
-
-router.use((req, res, next) => {
-  next(createError(404))
-})
-
-router.use((err, req, res, next) => {
-  res.status(err.status || 500).send(err.message)
-})
 
 exports.main = router
